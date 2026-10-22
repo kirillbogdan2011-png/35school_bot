@@ -1,9 +1,3 @@
-
-# ==========================================
-# 2. БАЗА ДАННЫХ (SQLite)
-# ==========================================
-import sqlite3
-
 import asyncio
 import csv
 import logging
@@ -28,6 +22,7 @@ from aiogram.types import (
     Message,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И НАСТРОЙКИ
@@ -38,18 +33,23 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 if not BOT_TOKEN:
-    raise ValueError("ОШИБКА: Задайте BOT_TOKEN в файле .env!")
+    raise ValueError("ОШИБКА: Задайте BOT_TOKEN в переменных окружения!")
 
 KYIV_TZ = pytz.timezone("Europe/Kyiv")
 DB_NAME = "school_bot.db"
 
-# Координаты городов для погоды
 CITIES = {
     "Чернигов": {"lat": 51.4939, "lon": 31.2943},
     "Киев": {"lat": 50.4501, "lon": 30.5234},
     "Львов": {"lat": 49.8397, "lon": 24.0297},
     "Одесса": {"lat": 46.4825, "lon": 30.7233},
 }
+
+# ==========================================
+# 2. БАЗА ДАННЫХ (SQLite)
+# ==========================================
+import sqlite3
+
 
 def get_connection():
     conn = sqlite3.connect(DB_NAME)
@@ -203,6 +203,8 @@ def get_full_week_schedule(class_name: str):
 
 
 def import_schedule_from_csv(file_path: str):
+    if not os.path.exists(file_path):
+        return 0
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM schedule")
@@ -326,7 +328,7 @@ def get_reminder_time_keyboard():
 def get_admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика классов", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📥 Загрузить CSV расписания", callback_data="admin_csv")],
+        [InlineKeyboardButton(text="📥 Перезагрузить schedule.csv", callback_data="admin_reload_csv")],
         [InlineKeyboardButton(text="🔙 В меню", callback_data="back_menu")]
     ])
 
@@ -334,10 +336,6 @@ def get_admin_keyboard():
 # ==========================================
 # 5. РОУТЕРЫ И ЛОГИКА БОТА
 # ==========================================
-class AdminStates(StatesGroup):
-    waiting_for_csv = State()
-
-
 router = Router()
 
 
@@ -578,46 +576,18 @@ async def admin_stats(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin_csv")
-async def admin_csv_prompt(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "admin_reload_csv")
+async def admin_reload_csv(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
 
-    await state.set_state(AdminStates.waiting_for_csv)
+    count = import_schedule_from_csv("schedule.csv")
     await callback.message.edit_text(
-        "📥 Пожалуйста, отправьте CSV-файл с расписанием.\n"
-        "Формат колонок: `class_name,day_of_week,lesson_number,subject,teacher,room,start_time,end_time`",
+        f"✅ Файл `schedule.csv` успешно перезагружен! Записано уроков: {count}",
+        reply_markup=get_admin_keyboard(),
         parse_mode="Markdown"
     )
     await callback.answer()
-
-
-@router.message(AdminStates.waiting_for_csv, F.document)
-async def process_csv_upload(message: Message, state: FSMContext, bot: Bot):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    document = message.document
-    if not document.file_name.endswith(".csv"):
-        await message.answer("❌ Пожалуйста, отправьте файл с расширением .csv")
-        return
-
-    file_info = await bot.get_file(document.file_id)
-    file_path = f"temp_{document.file_name}"
-    await bot.download_file(file_info.file_path, file_path)
-
-    try:
-        count = import_schedule_from_csv(file_path)
-        os.remove(file_path)
-        await state.clear()
-        await message.answer(
-            f"✅ Расписание успешно импортировано! Записано уроков: {count}",
-            reply_markup=get_admin_keyboard()
-        )
-    except Exception as e:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        await message.answer(f"❌ Ошибка при обработке CSV: {e}")
 
 
 # ==========================================
@@ -691,8 +661,12 @@ async def check_lessons_reminders(bot: Bot):
 
 
 # ==========================================
-# 7. ЗАПУСК БОТА
+# 7. ЗАПУСК БОТА (Веб-сервер запускается ПЕРВЫМ)
 # ==========================================
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -700,7 +674,20 @@ async def main():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
+    # 1. Сначала запускаем веб-сервер для Render, чтобы он ответил мгновенно и не было Timed Out
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 Встроенный веб-сервер запущен на порту {port}")
+
     init_db()
+
+    count = import_schedule_from_csv("schedule.csv")
+    logging.info(f"📂 Загружено уроков из schedule.csv: {count}")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -720,4 +707,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот остановлен.")
-        
